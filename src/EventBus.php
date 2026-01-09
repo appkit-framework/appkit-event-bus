@@ -90,7 +90,8 @@ class EventBus implements StartStopInterface, HealthIndicatorInterface {
                 $bodyJson,
                 $headers,
                 self::AMQP_PREFIX,
-                $this -> appId . '_' . $event
+                $this -> appId . '_' . $event,
+                confirm: true
             );
         } catch(Throwable $e) {
             $error = 'Failed to publish AMQP message';
