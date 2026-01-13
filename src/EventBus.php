@@ -6,7 +6,8 @@ use AppKit\StartStop\StartStopInterface;
 use AppKit\Health\HealthIndicatorInterface;
 use AppKit\Health\HealthCheckResult;
 use AppKit\Json\Json;
-use AppKit\Amqp\AmqpReject;
+use AppKit\Amqp\AmqpNackReject;
+use AppKit\Amqp\AmqpNackRequeue;
 
 use Throwable;
 
@@ -65,6 +66,7 @@ class EventBus implements StartStopInterface, HealthIndicatorInterface {
             $this -> log -> warning("Subscription $tag is still active at shutdown");
             try {
                 $this -> unsub($tag);
+                $this -> log -> info("Canceled subscription $tag");
             } catch(Throwable $e) {
                 $this -> log -> error("Failed to cancel subscription $tag", $e);
             }
@@ -83,10 +85,17 @@ class EventBus implements StartStopInterface, HealthIndicatorInterface {
         if($ttl)
             $headers['expiration'] = (string)($ttl * 1000);
 
-        $bodyJson = Json::encode($body);
+        try {
+            $bodyJson = Json::encode($body);
+        } catch(Throwable $e) {
+            throw new EventBusException(
+                'Failed to encode message: ' . $e -> getMessage(),
+                previous: $e
+            );
+        }
 
         try {
-            $this -> amqp -> publish(
+            return $this -> amqp -> publish(
                 $bodyJson,
                 $headers,
                 self::AMQP_PREFIX,
@@ -106,7 +115,7 @@ class EventBus implements StartStopInterface, HealthIndicatorInterface {
     public function sub(
         $appId,
         $event,
-        $callback,
+        $handler,
         $headers = [],
         $context = 'default',
         $broadcast = true,
@@ -128,7 +137,7 @@ class EventBus implements StartStopInterface, HealthIndicatorInterface {
             $tag,
             $appId,
             $event,
-            $callback,
+            $handler,
             $headers,
             $broadcast,
             $persistent,
@@ -137,9 +146,9 @@ class EventBus implements StartStopInterface, HealthIndicatorInterface {
         ];
 
         $this -> subInternal(...$subRestoreData);
-
         $this -> subRestoreData[$tag] = $subRestoreData;
-        $this -> log -> info("Subscribed $appId/$event => $context, tag: $tag");
+
+        $this -> log -> debug("New subscription: $appId/$event => $context, tag: $tag");
 
         return $tag;
     }
@@ -154,7 +163,7 @@ class EventBus implements StartStopInterface, HealthIndicatorInterface {
         }
 
         unset($this -> subRestoreData[$tag]);
-        $this -> log -> info("Canceled subscription $tag");
+        $this -> log -> debug("Cleaned up subscription $tag");
 
         return $this;
     }
@@ -163,7 +172,7 @@ class EventBus implements StartStopInterface, HealthIndicatorInterface {
         $subTag,
         $appId,
         $event,
-        $callback,
+        $handler,
         $headers,
         $broadcast,
         $persistent,
@@ -244,8 +253,14 @@ class EventBus implements StartStopInterface, HealthIndicatorInterface {
             try {
                 $ctag = $this -> amqp -> consume(
                     $queue,
-                    function($body, $headers) use($callback, $subTag) {
-                        return $this -> handleMessage($body, $headers, $callback, $subTag);
+                    function($body, $headers) use($handler, $appId, $event) {
+                        return $this -> handleMessage(
+                            $body,
+                            $headers,
+                            $handler,
+                            $appId,
+                            $event
+                        );
                     },
                     exclusive: $broadcast,
                     concurrency: $concurrency,
@@ -282,7 +297,7 @@ class EventBus implements StartStopInterface, HealthIndicatorInterface {
                 $this -> log -> debug("Canceled consumer $ctag");
             } catch(Throwable $e) {
                 $error = "Failed to cancel consumer";
-                $this -> log -> error("$error $ctag");
+                $this -> log -> error("$error $ctag", $e);
                 throw new EventBusException($error, previous: $e);
             }
         }
@@ -313,30 +328,33 @@ class EventBus implements StartStopInterface, HealthIndicatorInterface {
         }
     }
 
-    private function handleMessage($bodyJson, $headers, $callback, $subTag) {
-        try {
-            try {
-                $body = Json::decode($bodyJson);
-            } catch(Throwable $e) {
-                $error = "Failed to decode message";
-                $this -> log -> error("$error for $subTag", $e);
-                throw new AmqpReject($error, previous: $e);
-            }
+    private function handleMessage($bodyJson, $headers, $handler, $appId, $event) {
+        $messageIdStr = $headers['message-id'] ?? 'missing message-id';
 
-            try {
-                $callback($body, $headers);
-            } catch(AmqpReject $e) {
-                throw $e;
-            } catch(Throwable $e) {
-                $this -> log -> error("Uncaught exception from $subTag callback", $e);
-                throw new AmqpReject(
-                    "Uncaught exception from subscription callback",
-                    previous: $e
-                );
-            }
-        } catch(AmqpReject $e) {
-            $this -> log -> warning("Rejecting message for $subTag", $e);
-            throw $e;
+        try {
+            $body = Json::decode($bodyJson);
+        } catch(Throwable $e) {
+            $this -> log -> warning(
+                "Rejecting corrupted event $appId/${event}[$messageIdStr]",
+                $e
+            );
+            throw new AmqpNackReject(
+                "Failed to decode message",
+                previous: $e
+            );
+        }
+
+        try {
+            $handler($body, $headers);
+        } catch(Throwable $e) {
+            $this -> log -> error(
+                "Requeuing event $appId/${event}[$messageIdStr] due to exception",
+                $e
+            );
+            throw new AmqpNackRequeue(
+                "Exception in event handler",
+                previous: $e
+            );
         }
     }
 }
