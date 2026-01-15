@@ -1,5 +1,5 @@
 {
-    "name": "appkit/amqp-event-bus",
+    "name": "appkit/event-bus",
     "type": "library",
     "description": "AMQP-based event bus for the AppKit framework",
     "license": "MIT",
@@ -11,7 +11,7 @@
     },
     "autoload": {
         "psr-4": {
-            "AppKit\\Amqp\\EventBus\\": "src/"
+            "AppKit\\EventBus\\": "src/"
         }
     },
     "config": {

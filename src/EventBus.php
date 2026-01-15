@@ -1,6 +1,6 @@
 <?php
 
-namespace AppKit\Amqp\EventBus;
+namespace AppKit\EventBus;
 
 use AppKit\StartStop\StartStopInterface;
 use AppKit\Health\HealthIndicatorInterface;
