@@ -10,6 +10,7 @@ use AppKit\Amqp\AmqpNackReject;
 use AppKit\Amqp\AmqpNackRequeue;
 
 use Throwable;
+use function React\Async\async;
 
 class EventBus implements StartStopInterface, HealthIndicatorInterface {
     const AMQP_PREFIX = 'appkit_eventbus';
@@ -50,9 +51,9 @@ class EventBus implements StartStopInterface, HealthIndicatorInterface {
             );
         }
 
-        $this -> amqp -> onConnect(function() {
+        $this -> amqp -> on('connect', async(function() {
             return $this -> onAmqpReconnect();
-        });
+        }));
 
         $this -> log -> info('Event bus is ready, instance ID: '. $this -> instanceId);
 
