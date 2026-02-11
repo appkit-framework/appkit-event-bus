@@ -530,9 +530,14 @@ class EventBus implements StartStopInterface, HealthIndicatorInterface {
         try {
             $handler($body, $headers);
         } catch(Throwable $e) {
-            $error = 'Uncaught exception in event handler';
-            $this -> log -> error($error, $e);
-            throw new AmqpNackRequeue($error, previous: $e);
+            $this -> log -> error(
+                'Uncaught exception in event handler, requeuing event',
+                $e
+            );
+            throw new AmqpNackRequeue(
+                'Exception in event handler',
+                previous: $e
+            );
         }
     }
 }
