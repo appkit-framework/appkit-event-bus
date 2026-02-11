@@ -13,7 +13,7 @@ use function AppKit\Async\async;
 use Throwable;
 
 class EventBus implements StartStopInterface, HealthIndicatorInterface {
-    const AMQP_PREFIX = 'appkit_eventbus';
+    const AMQP_PREFIX = 'ak_eb';
 
     private $appId;
     private $amqp;
@@ -33,18 +33,27 @@ class EventBus implements StartStopInterface, HealthIndicatorInterface {
     }
 
     public function start() {
+        $mainExchange = self::AMQP_PREFIX;
+
         try {
             $this -> amqp -> declareExchange(
-                self::AMQP_PREFIX,
+                $mainExchange,
                 'direct',
                 false, // passive
                 true, // durable
                 false // autoDelete
             );
-            $this -> log -> debug('Declared event bus exchange');
+            $this -> log -> debug(
+                'Declared main exchange',
+                [ 'exchange' => $mainExchange ]
+            );
         } catch(Throwable $e) {
-            $error = 'Failed to declare event bus exchange';
-            $this -> log -> error($error, $e);
+            $error = 'Failed to declare main exchange';
+            $this -> log -> error(
+                $error,
+                [ 'exchange' => $mainExchange ],
+                $e
+            );
             throw new EventBusException(
                 $error,
                 previous: $e
@@ -55,7 +64,10 @@ class EventBus implements StartStopInterface, HealthIndicatorInterface {
             return $this -> onAmqpReconnect();
         }));
 
-        $this -> log -> info('Event bus is ready, instance ID: '. $this -> instanceId);
+        $this -> log -> info(
+            'Event bus is ready',
+            [ 'instanceId' => $this -> instanceId ]
+        );
 
         $this -> isStarted = true;
     }
@@ -63,13 +75,23 @@ class EventBus implements StartStopInterface, HealthIndicatorInterface {
     public function stop() {
         $this -> isStarted = false;
 
-        foreach($this -> subRestoreData as $tag => $_) {
-            $this -> log -> warning("Subscription $tag is still active at shutdown");
+        foreach($this -> subRestoreData as $subId => $_) {
+            $this -> log -> warning(
+                'Subscription is still active at shutdown',
+                [ 'subId' => $subId ]
+            );
             try {
-                $this -> unsub($tag);
-                $this -> log -> info("Canceled subscription $tag");
+                $this -> unsub($subId);
+                $this -> log -> info(
+                    'Canceled subscription',
+                    [ 'subId' => $subId ]
+                );
             } catch(Throwable $e) {
-                $this -> log -> error("Failed to cancel subscription $tag", $e);
+                $this -> log -> error(
+                    'Failed to cancel subscription',
+                    [ 'subId' => $subId ],
+                    $e
+                );
             }
         }
     }
@@ -95,17 +117,28 @@ class EventBus implements StartStopInterface, HealthIndicatorInterface {
             );
         }
 
+        $exchange = self::AMQP_PREFIX;
+        $routingKey = $this -> appId . '_' . $event;
         try {
             return $this -> amqp -> publish(
                 $bodyJson,
                 $headers,
-                self::AMQP_PREFIX,
-                $this -> appId . '_' . $event,
+                $exchange,
+                $routingKey,
                 confirm: true
             );
         } catch(Throwable $e) {
             $error = 'Failed to publish AMQP message';
-            $this -> log -> error($error, $e);
+            $this -> log -> error(
+                $error,
+                [
+                    'event' => $event,
+                    'headers' => $headers,
+                    'exchange' => $exchange,
+                    'routingKey' => $routingKey
+                ],
+                $e
+            );
             throw new EventBusException(
                 $error,
                 previous: $e
@@ -124,113 +157,182 @@ class EventBus implements StartStopInterface, HealthIndicatorInterface {
         $concurrency = 1,
         $prefetchCount = null
     ) {
-        $tag = "${appId}_${event}_" . $this -> appId . "_$context";
-        if($broadcast)
-            $tag .= '_' . $this -> instanceId;
+        $subId = $appId . '/' . $event . '@' . $context;
 
-        if(isset($this -> subRestoreData[$tag]))
+        if(isset($this -> subRestoreData[$subId]))
             throw new EventBusException("Context $context already in use for event $appId/$event");
 
         if($broadcast && $persistent)
             throw new EventBusException('Broadcast and persistent cannot be used together');
 
         $subRestoreData = [
-            $tag,
             $appId,
             $event,
             $handler,
             $headers,
+            $context,
             $broadcast,
             $persistent,
             $concurrency,
             $prefetchCount
         ];
 
-        $this -> subInternal(...$subRestoreData);
-        $this -> subRestoreData[$tag] = $subRestoreData;
+        $this -> subInternal($subId, ...$subRestoreData);
+        $this -> subRestoreData[$subId] = $subRestoreData;
 
-        $this -> log -> debug("New subscription: $appId/$event => $context, tag: $tag");
+        $this -> log -> debug(
+            'Created subscription',
+            [
+                'subId' => $subId,
+                'headers' => $headers,
+                'broadcast' => $broadcast,
+                'persistent' => $persistent,
+                'concurrency' => $concurrency,
+                'prefetchCount' => $prefetchCount
+            ]
+        );
 
-        return $tag;
+        return $subId;
     }
 
-    public function unsub($tag) {
-        if(!isset($this -> subRestoreData[$tag]))
-            throw new EventBusException("Invalid subscription tag $tag");
+    public function unsub($subId) {
+        if(!isset($this -> subRestoreData[$subId]))
+            throw new EventBusException("Invalid subscription ID $subId");
 
-        if(isset($this -> subUnsubData[$tag])) {
-            $this -> unsubInternal($this -> subUnsubData[$tag]);
-            unset($this -> subUnsubData[$tag]);
+        if(isset($this -> subUnsubData[$subId])) {
+            $this -> unsubInternal($this -> subUnsubData[$subId], $subId);
+            unset($this -> subUnsubData[$subId]);
         }
 
-        unset($this -> subRestoreData[$tag]);
-        $this -> log -> debug("Cleaned up subscription $tag");
+        unset($this -> subRestoreData[$subId]);
+        $this -> log -> debug(
+            'Cleaned up subscription',
+            [ 'subId' => $subId ]
+        );
 
         return $this;
     }
 
     private function subInternal(
-        $subTag,
+        $subId,
         $appId,
         $event,
         $handler,
         $headers,
+        $context,
         $broadcast,
         $persistent,
         $concurrency,
         $prefetchCount
     ) {
         $unsubData = [];
+
         try {
-            $exchange = self::AMQP_PREFIX . "_${appId}_$event";
+            $eventExchange = self::AMQP_PREFIX . '_' . $appId . '_' . $event;
 
             try {
                 $this -> amqp -> declareExchange(
-                    $exchange,
+                    $eventExchange,
                     'headers',
                     false, // passive
                     true, // durable
                     true, // autoDelete
                     true // internal
                 );
-                $this -> log -> debug("Declared exchange $exchange");
+                $this -> log -> debug(
+                    'Declared event exchange',
+                    [
+                        'exchange' => $eventExchange,
+                        'subId' => $subId
+                    ]
+                );
             } catch(Throwable $e) {
-                $error = 'Failed to declare exchange';
-                $this -> log -> error("$error $exchange", $e);
+                $error = 'Failed to declare event exchange';
+                $this -> log -> error(
+                    $error,
+                    [
+                        'exchange' => $eventExchange,
+                        'subId' => $subId
+                    ],
+                    $e
+                );
                 throw new EventBusException($error, previous: $e);
             }
+
+            $mainExchange = self::AMQP_PREFIX;
+            $routingKey = $appId . '_' . $event;
 
             try {
-                $routingKey = "${appId}_$event";
-                $logMsg = "$exchange to " . self::AMQP_PREFIX . " by routing key $routingKey";
                 $this -> amqp -> bindExchange(
-                    $exchange,
-                    self::AMQP_PREFIX,
+                    $eventExchange,
+                    $mainExchange,
                     $routingKey
                 );
-                $this -> log -> debug("Bound exchange $logMsg");
+                $this -> log -> debug(
+                    'Bound event exchange to main exchange',
+                    [
+                        'eventExchange' => $eventExchange,
+                        'mainExchange' => $mainExchange,
+                        'routingKey' => $routingKey,
+                        'subId' => $subId
+                    ]
+                );
             } catch(Throwable $e) {
-                $error = 'Failed to bind exchange';
-                $this -> log -> error("$error $logMsg", $e);
+                $error = 'Failed to bind event exchange to main exchange';
+                $this -> log -> error(
+                    $error,
+                    [
+                        'eventExchange' => $eventExchange,
+                        'mainExchange' => $mainExchange,
+                        'routingKey' => $routingKey,
+                        'subId' => $subId
+                    ],
+                    $e
+                );
                 throw new EventBusException($error, previous: $e);
             }
 
-            $queue = self::AMQP_PREFIX . "_$subTag";
+            $queue = $eventExchange . '_' . $this -> appId . '_' . $context;
+            if($broadcast)
+                $queue .= '_' . $this -> instanceId;
             if(strlen($queue) > 255)
-                $queue = self::AMQP_PREFIX . '_' . hash('sha256', $subTag);
+                $queue = self::AMQP_PREFIX . '_' . hash('sha256', $queue);
+
+            $durable = $persistent;
+            $exclusive = $broadcast;
+            $autoDelete = ! $persistent;
 
             try {
                 $this -> amqp -> declareQueue(
                     $queue,
                     false, // passive
-                    $persistent, // durable
-                    $broadcast, // exclusive
-                    ! $persistent // autoDelete
+                    $durable, // durable
+                    $exclusive, // exclusive
+                    $autoDelete // autoDelete
                 );
-                $this -> log -> debug("Declared queue $queue");
+                $this -> log -> debug(
+                    'Declared subscription queue',
+                    [
+                        'queue' => $queue,
+                        'durable' => $durable,
+                        'exclusive' => $exclusive,
+                        'autoDelete' => $autoDelete,
+                        'subId' => $subId
+                    ]
+                );
             } catch(Throwable $e) {
-                $error = 'Failed to declare queue';
-                $this -> log -> error("$error $queue", $e);
+                $error = 'Failed to declare subscription queue';
+                $this -> log -> error(
+                    $error,
+                    [
+                        'queue' => $queue,
+                        'durable' => $durable,
+                        'exclusive' => $exclusive,
+                        'autoDelete' => $autoDelete,
+                        'subId' => $subId
+                    ],
+                    $e
+                );
                 throw new EventBusException($error, previous: $e);
             }
 
@@ -238,124 +340,199 @@ class EventBus implements StartStopInterface, HealthIndicatorInterface {
                 $unsubData['queue'] = $queue;
 
             try {
-                $logMsg = "$queue to exchange $exchange";
                 $this -> amqp -> bindQueue(
                     $queue,
-                    $exchange,
+                    $eventExchange,
                     arguments: $headers
                 );
-                $this -> log -> debug("Bound queue $logMsg");
+                $this -> log -> debug(
+                    'Bound subscription queue to event exchange',
+                    [
+                        'queue' => $queue,
+                        'exchange' => $eventExchange,
+                        'headers' => $headers,
+                        'subId' => $subId
+                    ]
+                );
             } catch(Throwable $e) {
-                $error = 'Failed to bind queue';
-                $this -> log -> error("$error $logMsg", $e);
+                $error = 'Failed to bind subscription queue to event exchange';
+                $this -> log -> error(
+                    $error,
+                    [
+                        'queue' => $queue,
+                        'exchange' => $eventExchange,
+                        'headers' => $headers,
+                        'subId' => $subId
+                    ],
+                    $e
+                );
                 throw new EventBusException($error, previous: $e);
             }
 
+            $exclusive = $broadcast;
+
             try {
-                $ctag = $this -> amqp -> consume(
+                $consumerTag = $this -> amqp -> consume(
                     $queue,
-                    function($body, $headers) use($handler, $appId, $event) {
+                    function($body, $headers) use($handler, $subId) {
                         return $this -> handleMessage(
                             $body,
                             $headers,
                             $handler,
-                            $appId,
-                            $event
+                            $subId
                         );
                     },
-                    exclusive: $broadcast,
+                    exclusive: $exclusive,
                     concurrency: $concurrency,
                     prefetchCount: $prefetchCount
                 );
-                $this -> log -> debug("Consumed queue $queue, consumer tag: $ctag");
+                $this -> log -> debug(
+                    'Started consumer',
+                    [
+                        'consumerTag' => $consumerTag,
+                        'queue' => $queue,
+                        'exclusive' => $exclusive,
+                        'concurrency' => $concurrency,
+                        'prefetchCount' => $prefetchCount,
+                        'subId' => $subId
+                    ]
+                );
             } catch(Throwable $e) {
-                $error = 'Failed to consume queue';
-                $this -> log -> error("$error $queue");
+                $error = 'Failed to start consumer';
+                $this -> log -> error(
+                    $error,
+                    [
+                        'queue' => $queue,
+                        'exclusive' => $exclusive,
+                        'concurrency' => $concurrency,
+                        'prefetchCount' => $prefetchCount,
+                        'subId' => $subId
+                    ],
+                    $e
+                );
                 throw new EventBusException($error, previous: $e);
             }
 
-            $unsubData['ctag'] = $ctag;
+            $unsubData['consumerTag'] = $consumerTag;
         } catch(EventBusException $e) {
             if(!empty($unsubData)) {
                 try {
-                    $this -> unsubInternal($unsubData);
-                    $this -> log -> debug("Rolled back subscription $subTag");
+                    $this -> unsubInternal($unsubData, $subId);
+                    $this -> log -> debug(
+                        'Rolled back subscription',
+                        [
+                            'unsubData' => $unsubData,
+                            'subId' => $subId
+                        ]
+                    );
                 } catch(EventBusException $e) {
-                    $this -> log -> error("Failed to rollback subscription $subTag", $e);
+                    $this -> log -> error(
+                        'Failed to rollback subscription',
+                        [
+                            'unsubData' => $unsubData,
+                            'subId' => $subId
+                        ],
+                        $e
+                    );
                 }
             }
             throw $e;
         }
 
-        $this -> subUnsubData[$subTag] = $unsubData;
+        $this -> subUnsubData[$subId] = $unsubData;
     }
 
-    private function unsubInternal($unsubData) {
-        if(isset($unsubData['ctag'])) {
-            $ctag = $unsubData['ctag'];
+    private function unsubInternal($unsubData, $subId) {
+        if(isset($unsubData['consumerTag'])) {
+            $consumerTag = $unsubData['consumerTag'];
+
             try {
-                $this -> amqp -> cancelConsumer($ctag);
-                $this -> log -> debug("Canceled consumer $ctag");
+                $this -> amqp -> cancelConsumer($consumerTag);
+                $this -> log -> debug(
+                    'Canceled consumer',
+                    [
+                        'consumerTag' => $consumerTag,
+                        'subId' => $subId
+                    ]
+                );
             } catch(Throwable $e) {
                 $error = "Failed to cancel consumer";
-                $this -> log -> error("$error $ctag", $e);
+                $this -> log -> error(
+                    $error,
+                    [
+                        'consumerTag' => $consumerTag,
+                        'subId' => $subId
+                    ],
+                    $e
+                );
                 throw new EventBusException($error, previous: $e);
             }
         }
 
         if(isset($unsubData['queue'])) {
             $queue = $unsubData['queue'];
+
             try {
                 $this -> amqp -> deleteQueue($queue);
-                $this -> log -> debug("Deleted queue $queue");
+                $this -> log -> debug(
+                    'Deleted queue',
+                    [
+                        'queue' => $queue,
+                        'subId' => $subId
+                    ]
+                );
             } catch(Throwable $e) {
                 $error = "Failed to delete queue";
-                $this -> log -> error("$error $queue", $e);
+                $this -> log -> error(
+                    $error,
+                    [
+                        'queue' => $queue,
+                        'subId' => $subId
+                    ],
+                    $e
+                );
                 throw new EventBusException($error, previous: $e);
             }
         }
     }
 
     private function onAmqpReconnect() {
-        $this -> log -> warning("Detected AMQP client reconnect, restoring all subscriptions...");
+        $this -> log -> warning('Detected AMQP client reconnect, restoring all subscriptions');
 
-        foreach($this -> subRestoreData as $tag => $restoreData) {
+        foreach($this -> subRestoreData as $subId => $restoreData) {
             try {
-                $this -> subInternal(...$restoreData);
-                $this -> log -> info("Restored subscription $tag");
+                $this -> subInternal($subId, ...$restoreData);
+                $this -> log -> info(
+                    'Restored subscription',
+                    [ 'subId' => $subId ]
+                );
             } catch(Throwable $e) {
-                $this -> log -> error("Failed to restore subscription $tag", $e);
+                $this -> log -> error(
+                    'Failed to restore subscription',
+                    [ 'subId' => $subId ],
+                    $e
+                );
             }
         }
     }
 
-    private function handleMessage($bodyJson, $headers, $handler, $appId, $event) {
-        $messageIdStr = $headers['message-id'] ?? 'missing message-id';
+    private function handleMessage($bodyJson, $headers, $handler, $subId) {
+        $this -> log -> setContext('ebSubId', $subId);
 
         try {
             $body = Json::decode($bodyJson);
         } catch(Throwable $e) {
-            $this -> log -> warning(
-                "Rejecting corrupted event $appId/${event}[$messageIdStr]",
-                $e
-            );
-            throw new AmqpNackReject(
-                "Failed to decode message",
-                previous: $e
-            );
+            $error = 'Failed to decode message';
+            $this -> log -> warning($error, $e);
+            throw new AmqpNackReject($error, previous: $e);
         }
 
         try {
             $handler($body, $headers);
         } catch(Throwable $e) {
-            $this -> log -> error(
-                "Requeuing event $appId/${event}[$messageIdStr] due to exception",
-                $e
-            );
-            throw new AmqpNackRequeue(
-                "Exception in event handler",
-                previous: $e
-            );
+            $error = 'Uncaught exception in event handler';
+            $this -> log -> error($error, $e);
+            throw new AmqpNackRequeue($error, previous: $e);
         }
     }
 }
